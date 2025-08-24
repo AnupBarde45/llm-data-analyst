@@ -17,15 +17,24 @@ st.title("🤖 LLM-Based Data Analyst Assistant")
 with st.sidebar:
     st.header("Configuration")
     
-    # Ollama URL
-    ollama_url = st.text_input("Ollama URL", value="http://localhost:11434")
+    # Model selection
+    model_choice = st.selectbox("Choose LLM:", ["Ollama (Llama3)", "Gemini API"])
+    
+    if model_choice == "Ollama (Llama3)":
+        api_input = st.text_input("Ollama URL", value="http://localhost:11434")
+    else:
+        api_input = st.text_input("Gemini API Key", type="password")
     
     if st.button("Initialize Assistant") and not st.session_state.assistant:
         try:
-            st.session_state.assistant = DataAnalystAssistant(ollama_url)
-            st.success("Assistant initialized!")
+            if model_choice == "Gemini API":
+                # You'll need to modify DataAnalystAssistant constructor
+                st.session_state.assistant = DataAnalystAssistant(api_input, use_gemini=True)
+            else:
+                st.session_state.assistant = DataAnalystAssistant(api_input)
+            st.success(f"Assistant initialized with {model_choice}!")
         except Exception as e:
-            st.error(f"Failed to connect to Ollama: {str(e)}")
+            st.error(f"Failed to initialize: {str(e)}")
     
     st.header("Upload Data")
     
@@ -38,12 +47,10 @@ with st.sidebar:
     
     if uploaded_files and st.session_state.assistant:
         for file in uploaded_files:
-            # Save uploaded file temporarily
             temp_path = f"temp_{file.name}"
             with open(temp_path, "wb") as f:
                 f.write(file.getbuffer())
             
-            # Load into assistant
             table_name = st.text_input(f"Table name for {file.name}", 
                                      value=os.path.splitext(file.name)[0])
             
@@ -51,13 +58,12 @@ with st.sidebar:
                 try:
                     result = st.session_state.assistant.load_file(temp_path, table_name)
                     st.success(result)
-                    os.remove(temp_path)  # Clean up
+                    os.remove(temp_path)
                 except Exception as e:
                     st.error(f"Error loading file: {str(e)}")
 
-# Main interface
+# Main interface (rest remains the same)
 if st.session_state.assistant:
-    # Show available tables
     if st.session_state.assistant.tables:
         st.subheader("Available Tables")
         for table_name, info in st.session_state.assistant.tables.items():
@@ -66,10 +72,8 @@ if st.session_state.assistant:
                 st.write("Sample data:")
                 st.json(info['sample_data'][:2])
     
-    # Chat interface
     st.subheader("Ask Questions About Your Data")
     
-    # Display chat history
     for chat in st.session_state.chat_history:
         with st.chat_message("user"):
             st.write(chat['question'])
@@ -84,7 +88,6 @@ if st.session_state.assistant:
             else:
                 st.error(chat['error'])
     
-    # Input for new question
     question = st.chat_input("Ask a question about your data...")
     
     if question:
@@ -106,4 +109,4 @@ if st.session_state.assistant:
                     st.error(result['error'])
 
 else:
-    st.warning("Please initialize the assistant in the sidebar. Make sure Ollama is running with Llama 3 model.")
+    st.warning("Please initialize the assistant in the sidebar with your preferred LLM.")

@@ -7,28 +7,165 @@ import json
 import re
 
 class DataAnalystAssistant:
-    def __init__(self, ollama_url: str = "http://localhost:11434"):
-        self.ollama_url = ollama_url
+    def __init__(self, api_input: str, use_gemini: bool = False):
+        self.use_gemini = use_gemini
         self.db_connection = sqlite3.connect(':memory:', check_same_thread=False)
         self.tables = {}
         
+        if use_gemini:
+            import google.generativeai as genai
+            genai.configure(api_key=api_input)
+            self.model = genai.GenerativeModel('gemini-pro')
+        else:
+            self.ollama_url = api_input
+    
+    def call_llm(self, prompt: str, max_tokens: int = 100) -> str:
+        """Call either Gemini or Ollama"""
+        try:
+            if self.use_gemini:
+                import google.generativeai as genai
+                response = self.model.generate_content(
+                    prompt,
+                    generation_config=genai.types.GenerationConfig(
+                        temperature=0.1,
+                        max_output_tokens=max_tokens
+                    )
+                )
+                result = response.text.strip()
+                print(f"Gemini raw response: {result}")  # Debug
+                return result
+            else:
+                response = requests.post(f"{self.ollama_url}/api/generate", json={
+                    "model": "llama3",
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {"temperature": 0, "num_predict": max_tokens}
+                })
+                if response.status_code == 200:
+                    result = response.json()
+                    if result and "response" in result:
+                        ollama_result = result["response"].strip()
+                        print(f"Ollama raw response: {ollama_result}")  # Debug
+                        return ollama_result
+            return ""
+        except Exception as e:
+            print(f"LLM error: {e}")
+            return ""
+        
+    def smart_column_names(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Clean column names based on actual data"""
+        col_mapping = {}
+        
+        for col in df.columns:
+            # Basic cleaning only
+            clean_col = str(col).strip()
+            clean_col = clean_col.replace('(', '_').replace(')', '')
+            clean_col = clean_col.replace('[', '_').replace(']', '')
+            clean_col = clean_col.replace('-', '_').replace(' ', '_')
+            clean_col = clean_col.replace('__', '_').strip('_')
+            
+            # Just capitalize words, no hardcoded replacements
+            clean_col = '_'.join(word.capitalize() for word in clean_col.split('_'))
+            col_mapping[col] = clean_col
+        
+        df = df.rename(columns=col_mapping)
+        print(f"Column mapping: {col_mapping}")
+        return df
+    
+    def analyze_column_types(self, df: pd.DataFrame) -> Dict[str, str]:
+        """Analyze column types based on actual data content"""
+        column_info = {}
+        
+        for col in df.columns:
+            sample_values = df[col].dropna().head(20)
+            
+            # Analyze based on actual data type and content
+            if df[col].dtype in ['int64', 'float64']:
+                # Check if it's an ID (sequential or unique integers)
+                if df[col].dtype == 'int64' and df[col].nunique() == len(df[col].dropna()):
+                    column_info[col] = 'identifier'
+                else:
+                    column_info[col] = 'numeric'
+            elif df[col].dtype == 'object':
+                # Check if it's mostly text
+                avg_length = sample_values.astype(str).str.len().mean()
+                if avg_length > 10:  # Longer strings are likely text/names
+                    column_info[col] = 'text'
+                else:
+                    column_info[col] = 'categorical'
+            else:
+                column_info[col] = 'other'
+        
+        return column_info
+    
+    def clean_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Clean and prepare data for analysis"""
+        print(f"Original data shape: {df.shape}")
+        print(f"Original columns: {list(df.columns)}")
+        
+        # 1. Smart column name cleaning
+        df = self.smart_column_names(df)
+        
+        # 2. Remove completely empty rows and columns
+        df = df.dropna(how='all')
+        df = df.dropna(axis=1, how='all')
+        
+        # 3. Clean string columns
+        for col in df.columns:
+            if df[col].dtype == 'object':
+                df[col] = df[col].astype(str).str.strip()
+                df[col] = df[col].replace(['nan', 'NaN', 'null', 'NULL', ''], None)
+        
+        # 4. Smart numeric conversion
+        for col in df.columns:
+            if df[col].dtype == 'object':
+                # Try to convert to numeric
+                numeric_series = pd.to_numeric(df[col], errors='coerce')
+                # Only convert if more than 80% of values are numeric
+                if numeric_series.notna().sum() / len(df) > 0.8:
+                    df[col] = numeric_series
+        
+        # 5. Handle missing values intelligently
+        for col in df.columns:
+            if df[col].dtype == 'object':
+                df[col] = df[col].fillna('Unknown')
+        
+        # 6. Analyze column types
+        column_types = self.analyze_column_types(df)
+        
+        print(f"Cleaned data shape: {df.shape}")
+        print(f"Final columns: {list(df.columns)}")
+        print(f"Column categories: {column_types}")
+        
+        return df
+    
     def load_file(self, file_path: str, table_name: str = None) -> str:
         if not table_name:
             table_name = os.path.splitext(os.path.basename(file_path))[0].lower()
         
+        # Load data
         if file_path.endswith('.csv'):
             df = pd.read_csv(file_path)
         else:
             df = pd.read_excel(file_path)
-            
+        
+        # Clean data before processing
+        df = self.clean_data(df)
+        
+        # Load into database
         df.to_sql(table_name, self.db_connection, if_exists='replace', index=False)
+        
+        # Analyze column types for better query generation
+        column_types = self.analyze_column_types(df)
         
         self.tables[table_name] = {
             'columns': list(df.columns),
-            'sample_data': df.head(3).to_dict('records')
+            'sample_data': df.head(3).to_dict('records'),
+            'dtypes': dict(df.dtypes),
+            'column_types': column_types
         }
         
-        return f"Loaded {len(df)} rows into table '{table_name}'"
+        return f"Loaded and cleaned {len(df)} rows into table '{table_name}'. Columns: {list(df.columns)}"
     
     def load_excel(self, file_path: str, table_name: str = None) -> str:
         return self.load_file(file_path, table_name)
@@ -111,42 +248,112 @@ class DataAnalystAssistant:
         if not table_names:
             raise Exception("No tables loaded.")
         
-        # Strategy 1: Entity extraction
+        table_name = table_names[0]
+        columns = self.tables[table_name]['columns']
+        question_lower = question.lower()
+        
+        # Dynamic query detection based on actual data
+        numbers = re.findall(r'\d+', question)
+        if numbers and any(word in question_lower for word in ['greater', 'less', 'more', 'than', '>', '<', '=', 'is']):
+            # Get column types from stored analysis
+            column_types = self.tables[table_name].get('column_types', {})
+            
+            # Find numeric columns
+            numeric_cols = [col for col, col_type in column_types.items() if col_type in ['numeric', 'numeric_discrete', 'numeric_continuous']]
+            
+            # If no column types stored, check data types
+            if not numeric_cols:
+                dtypes = self.tables[table_name].get('dtypes', {})
+                numeric_cols = [col for col, dtype in dtypes.items() if 'int' in str(dtype) or 'float' in str(dtype)]
+            
+            # Find best matching column by comparing question words with column names
+            question_words = set(question_lower.split())
+            best_col = None
+            max_score = 0
+            
+            for col in numeric_cols:
+                col_words = set(col.lower().replace('_', ' ').split())
+                # Score based on word overlap
+                score = len(question_words.intersection(col_words))
+                if score > max_score:
+                    max_score = score
+                    best_col = col
+            
+            # If no word match, use first numeric column
+            if not best_col and numeric_cols:
+                best_col = numeric_cols[0]
+            
+            if best_col:
+                amount = numbers[0]
+                if 'greater' in question_lower or 'more' in question_lower or '>' in question:
+                    return f"SELECT * FROM {table_name} WHERE {best_col} > {amount}"
+                elif 'less' in question_lower or '<' in question:
+                    return f"SELECT * FROM {table_name} WHERE {best_col} < {amount}"
+                else:
+                    return f"SELECT * FROM {table_name} WHERE {best_col} = {amount}"
+        
+        # Strategy 1: Entity extraction for movie/title data
         entities = self.extract_entities(question)
         
         if 'title' in entities:
-            # Find actual matching title in data
-            actual_title = self.find_similar_titles(entities['title'], table_names[0])
+            # Find title column
+            title_col = None
+            for col in columns:
+                if 'title' in col.lower() or 'name' in col.lower() or 'movie' in col.lower():
+                    title_col = col
+                    break
             
-            # Determine what to select based on question
-            if any(word in question.lower() for word in ['director', 'directed']):
-                return f"SELECT Director FROM {table_names[0]} WHERE Title LIKE '%{actual_title}%'"
-            elif any(word in question.lower() for word in ['cast', 'actor', 'starring']):
-                return f"SELECT Cast FROM {table_names[0]} WHERE Title LIKE '%{actual_title}%'"
-            else:
-                return f"SELECT * FROM {table_names[0]} WHERE Title LIKE '%{actual_title}%'"
+            if title_col:
+                actual_title = self.find_similar_titles(entities['title'], table_name)
+                
+                if any(word in question_lower for word in ['director', 'directed']):
+                    director_col = next((col for col in columns if 'director' in col.lower()), None)
+                    if director_col:
+                        return f"SELECT {director_col} FROM {table_name} WHERE {title_col} LIKE '%{actual_title}%'"
+                elif any(word in question_lower for word in ['cast', 'actor', 'starring']):
+                    cast_col = next((col for col in columns if 'cast' in col.lower() or 'actor' in col.lower()), None)
+                    if cast_col:
+                        return f"SELECT {cast_col} FROM {table_name} WHERE {title_col} LIKE '%{actual_title}%'"
+                else:
+                    return f"SELECT * FROM {table_name} WHERE {title_col} LIKE '%{actual_title}%'"
         
-        # Strategy 2: Keyword-based search
-        search_terms = re.findall(r'\b\w+\b', question.lower())
-        search_terms = [term for term in search_terms if len(term) > 2 and 
-                       term not in ['who', 'what', 'the', 'and', 'director', 'actor', 'cast', 'movie', 'film']]
+        # Always fallback to LLM with better prompt
+        schema = self.get_schema_context()
         
-        if search_terms:
-            conditions = []
-            for term in search_terms:
-                conditions.append(f"Title LIKE '%{term}%'")
-            
-            where_clause = " AND ".join(conditions)
-            
-            if any(word in question.lower() for word in ['director', 'directed']):
-                return f"SELECT Director FROM {table_names[0]} WHERE {where_clause}"
-            elif any(word in question.lower() for word in ['cast', 'actor', 'starring']):
-                return f"SELECT Cast FROM {table_names[0]} WHERE {where_clause}"
-            else:
-                return f"SELECT * FROM {table_names[0]} WHERE {where_clause}"
+        # Simple, direct prompt
+        prompt = f"""Database Schema:
+{schema}
+
+Question: {question}
+
+Write a SQL SELECT query using the exact column names shown above.
+
+SQL:"""
         
-        # Fallback
-        return f"SELECT * FROM {table_names[0]} LIMIT 5"
+        print(f"Calling LLM with prompt: {prompt[:200]}...")  # Debug
+        llm_response = self.call_llm(prompt, 150)
+        print(f"LLM response: {llm_response}")  # Debug
+        
+        if llm_response:
+            cleaned = self.clean_sql(llm_response)
+            print(f"Cleaned SQL: {cleaned}")  # Debug
+            return cleaned
+        
+        # If LLM fails, try simple pattern matching
+        numbers = re.findall(r'\d+', question)
+        if numbers:
+            # Just use first numeric column and first number
+            for col in columns:
+                try:
+                    cursor = self.db_connection.cursor()
+                    cursor.execute(f"SELECT typeof({col}) FROM {table_name} LIMIT 1")
+                    col_type = cursor.fetchone()[0]
+                    if col_type in ['integer', 'real']:
+                        return f"SELECT * FROM {table_name} WHERE {col} = {numbers[0]}"
+                except:
+                    continue
+        
+        raise Exception(f"Could not generate SQL. Available columns: {columns}")
     
     def clean_sql(self, sql: str) -> str:
         sql = re.sub(r'```sql\n?|```\n?|SQL:|Query:', '', sql, flags=re.IGNORECASE)
@@ -166,34 +373,16 @@ class DataAnalystAssistant:
         try:
             return self.smart_search(question)
         except Exception:
-            # Fallback to LLM if smart search fails
+            # Always fallback to LLM - no LIMIT 5
             schema = self.get_schema_context()
-            table_names = list(self.tables.keys())
+            prompt = f"{schema}\n\nQUESTION: {question}\n\nGenerate SQL query using EXACT column names from schema above. Return ONLY the SQL query.\n\nSQL:"
             
-            prompt = f"""{schema}
-
-QUESTION: {question}
-
-Generate SQL query. Use LIKE for partial text matches.
-
-SQL:"""
+            llm_response = self.call_llm(prompt, 100)
+            if llm_response:
+                return self.clean_sql(llm_response)
             
-            try:
-                response = requests.post(f"{self.ollama_url}/api/generate", json={
-                    "model": "llama3",
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {"temperature": 0, "num_predict": 100}
-                })
-                
-                if response.status_code == 200:
-                    result = response.json()
-                    if result and "response" in result and result["response"]:
-                        return self.clean_sql(result["response"])
-            except Exception:
-                pass
-            
-            return f"SELECT * FROM {table_names[0]} LIMIT 5"
+            # If LLM also fails, raise error instead of LIMIT 5
+            raise Exception("Could not generate SQL query for your question.")
     
     def execute_query(self, sql_query: str) -> pd.DataFrame:
         try:
@@ -209,28 +398,11 @@ SQL:"""
         if len(results) == 0:
             return "No results found for your query."
         
-        summary = f"Query returned {len(results)} rows."
-        if len(results) > 0:
-            summary += f" Sample: {results.head(2).to_dict('records')}"
+        summary = f"Query returned {len(results)} rows. Sample: {results.head(2).to_dict('records')}"
+        prompt = f"Question: {question}\nResults: {summary}\n\nAnswer naturally and conversationally:"
         
-        prompt = f"Question: {question}\nResults: {summary}\n\nAnswer the question naturally based on the results. Be conversational and helpful."
-        
-        try:
-            response = requests.post(f"{self.ollama_url}/api/generate", json={
-                "model": "llama3",
-                "prompt": prompt,
-                "stream": False,
-                "options": {"temperature": 0.2, "num_predict": 80}
-            })
-            
-            if response.status_code == 200:
-                result = response.json()
-                if result and "response" in result and result["response"]:
-                    return result["response"].strip()
-        except Exception:
-            pass
-        
-        return f"Found {len(results)} results for your query."
+        llm_response = self.call_llm(prompt, 150)
+        return llm_response if llm_response else f"Found {len(results)} results for your query."
     
     def analyze(self, question: str) -> Dict[str, Any]:
         try:
