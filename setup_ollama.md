@@ -28,3 +28,9 @@ curl http://localhost:11434/api/generate -d '{
 ```
 
 Now you can run the data analyst assistant!
+
+
+## Run application
+```bash
+streamlit run web_interface.py
+```
