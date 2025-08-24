@@ -1,23 +1,51 @@
 import pandas as pd
 import sqlite3
+import mysql.connector
 import requests
 from typing import Dict, Any
 import os
 import json
 import re
+from sqlalchemy import create_engine
 
 class DataAnalystAssistant:
-    def __init__(self, api_input: str, use_gemini: bool = False):
+    def __init__(self, api_input: str, use_gemini: bool = False, mysql_config: dict = None):
         self.use_gemini = use_gemini
-        self.db_connection = sqlite3.connect(':memory:', check_same_thread=False)
+        self.mysql_config = mysql_config
         self.tables = {}
         
+        # Database setup
+        if mysql_config:
+            self.setup_mysql_connection()
+        else:
+            self.db_connection = sqlite3.connect(':memory:', check_same_thread=False)
+            self.db_type = 'sqlite'
+        
+        # LLM setup
         if use_gemini:
             import google.generativeai as genai
             genai.configure(api_key=api_input)
             self.model = genai.GenerativeModel('gemini-pro')
         else:
             self.ollama_url = api_input
+    
+    def setup_mysql_connection(self):
+        """Setup MySQL database connection"""
+        try:
+            # Create SQLAlchemy engine for pandas
+            connection_string = f"mysql+mysqlconnector://{self.mysql_config['user']}:{self.mysql_config['password']}@{self.mysql_config['host']}:{self.mysql_config['port']}/{self.mysql_config['database']}"
+            self.engine = create_engine(connection_string)
+            
+            # Create direct MySQL connection for queries
+            self.db_connection = mysql.connector.connect(**self.mysql_config)
+            self.db_type = 'mysql'
+            
+            print(f"Connected to MySQL database: {self.mysql_config['database']}")
+        except Exception as e:
+            print(f"MySQL connection failed: {e}")
+            print("Falling back to SQLite...")
+            self.db_connection = sqlite3.connect(':memory:', check_same_thread=False)
+            self.db_type = 'sqlite'
     
     def call_llm(self, prompt: str, max_tokens: int = 100) -> str:
         """Call either Gemini or Ollama"""
@@ -153,7 +181,10 @@ class DataAnalystAssistant:
         df = self.clean_data(df)
         
         # Load into database
-        df.to_sql(table_name, self.db_connection, if_exists='replace', index=False)
+        if self.db_type == 'mysql':
+            df.to_sql(table_name, self.engine, if_exists='replace', index=False)
+        else:
+            df.to_sql(table_name, self.db_connection, if_exists='replace', index=False)
         
         # Analyze column types for better query generation
         column_types = self.analyze_column_types(df)
@@ -183,63 +214,60 @@ class DataAnalystAssistant:
         
         return context
     
-    def extract_entities(self, question: str) -> Dict[str, str]:
-        """Extract meaningful entities from the question"""
-        entities = {}
+    def handle_complex_query(self, question: str, table_name: str, columns: list) -> str:
+        """Handle AND/OR queries with multiple conditions"""
+        question_lower = question.lower()
         
-        # Comprehensive patterns for movie titles and names
-        patterns = [
-            r'director of\s+(.+?)(?:\?|$|who|what)',  # "director of 3 idiots"
-            r'who directed\s+(.+?)(?:\?|$)',          # "who directed 3 idiots"
-            r'cast of\s+(.+?)(?:\?|$)',               # "cast of 3 idiots"
-            r'actor in\s+(.+?)(?:\?|$)',              # "actor in 3 idiots"
-            r'starring in\s+(.+?)(?:\?|$)',           # "starring in 3 idiots"
-            r'movie\s+(.+?)(?:\?|$)',                 # "movie 3 idiots"
-            r'film\s+(.+?)(?:\?|$)',                  # "film 3 idiots"
-            r'["\'](.*?)["\']',                       # quoted text
-        ]
+        # Split by AND/OR
+        if ' and ' in question_lower:
+            parts = question_lower.split(' and ')
+            operator = ' AND '
+        elif ' or ' in question_lower:
+            parts = question_lower.split(' or ')
+            operator = ' OR '
+        else:
+            return None
         
-        for pattern in patterns:
-            match = re.search(pattern, question.lower())
-            if match:
-                title = match.group(1).strip()
-                if title and len(title) > 1:
-                    entities['title'] = title
-                    break
+        conditions = []
+        detected_columns = []
         
-        return entities
-    
-    def find_similar_titles(self, search_term: str, table_name: str) -> str:
-        """Find similar titles in actual data"""
-        try:
-            # Get all titles from the data
-            cursor = self.db_connection.cursor()
-            cursor.execute(f"SELECT DISTINCT Title FROM {table_name}")
-            titles = [row[0] for row in cursor.fetchall() if row[0]]
+        for part in parts:
+            part = part.strip()
+            numbers = re.findall(r'\d+', part)
             
-            # Find best match
-            search_lower = search_term.lower()
+            # Find matching column for this part
+            part_words = set(part.split())
+            best_col = None
+            max_score = 0
             
-            # Exact match first
-            for title in titles:
-                if search_lower == title.lower():
-                    return title
+            for col in columns:
+                col_words = set(col.lower().replace('_', ' ').split())
+                score = len(part_words.intersection(col_words))
+                if score > max_score:
+                    max_score = score
+                    best_col = col
             
-            # Partial match
-            for title in titles:
-                if search_lower in title.lower() or title.lower() in search_lower:
-                    return title
-            
-            # Word-by-word match
-            search_words = search_lower.split()
-            for title in titles:
-                title_lower = title.lower()
-                if all(word in title_lower for word in search_words):
-                    return title
-            
-            return search_term  # fallback
-        except:
-            return search_term
+            if best_col and numbers:
+                detected_columns.append(best_col)
+                amount = numbers[0]
+                
+                # Build condition based on comparison words
+                if 'greater' in part or 'more' in part or '>' in part:
+                    conditions.append(f"{best_col} > {amount}")
+                elif 'less' in part or '<' in part:
+                    conditions.append(f"{best_col} < {amount}")
+                elif 'between' in part and len(numbers) >= 2:
+                    conditions.append(f"{best_col} BETWEEN {numbers[0]} AND {numbers[1]}")
+                else:
+                    conditions.append(f"{best_col} = {amount}")
+        
+        if conditions:
+            where_clause = operator.join(conditions)
+            print(f"Detected columns: {detected_columns}")
+            print(f"Complex query conditions: {where_clause}")
+            return f"SELECT * FROM {table_name} WHERE {where_clause}"
+        
+        return None
     
     def smart_search(self, question: str) -> str:
         """Multi-strategy search for robust results"""
@@ -252,38 +280,53 @@ class DataAnalystAssistant:
         columns = self.tables[table_name]['columns']
         question_lower = question.lower()
         
+        # Handle complex AND/OR queries first
+        if ' and ' in question_lower or ' or ' in question_lower:
+            complex_result = self.handle_complex_query(question, table_name, columns)
+            if complex_result:
+                return complex_result
+        
         # Dynamic query detection based on actual data
         numbers = re.findall(r'\d+', question)
-        if numbers and any(word in question_lower for word in ['greater', 'less', 'more', 'than', '>', '<', '=', 'is']):
-            # Get column types from stored analysis
-            column_types = self.tables[table_name].get('column_types', {})
+        
+        # Get column types from stored analysis
+        column_types = self.tables[table_name].get('column_types', {})
+        dtypes = self.tables[table_name].get('dtypes', {})
+        
+        # Find numeric columns
+        numeric_cols = [col for col, col_type in column_types.items() if col_type in ['numeric', 'numeric_discrete', 'numeric_continuous']]
+        if not numeric_cols:
+            numeric_cols = [col for col, dtype in dtypes.items() if 'int' in str(dtype) or 'float' in str(dtype)]
+        
+        # Find best matching column by comparing question words with column names
+        question_words = set(question_lower.split())
+        best_col = None
+        max_score = 0
+        
+        for col in numeric_cols:
+            col_words = set(col.lower().replace('_', ' ').split())
+            score = len(question_words.intersection(col_words))
+            if score > max_score:
+                max_score = score
+                best_col = col
+        
+        # If no word match, use first numeric column
+        if not best_col and numeric_cols:
+            best_col = numeric_cols[0]
+        
+        if best_col and numbers:
+            print(f"Detected column: {best_col} (type: {column_types.get(best_col, 'unknown')})")
             
-            # Find numeric columns
-            numeric_cols = [col for col, col_type in column_types.items() if col_type in ['numeric', 'numeric_discrete', 'numeric_continuous']]
+            # Handle BETWEEN queries
+            if 'between' in question_lower and len(numbers) >= 2:
+                return f"SELECT * FROM {table_name} WHERE {best_col} BETWEEN {numbers[0]} AND {numbers[1]}"
             
-            # If no column types stored, check data types
-            if not numeric_cols:
-                dtypes = self.tables[table_name].get('dtypes', {})
-                numeric_cols = [col for col, dtype in dtypes.items() if 'int' in str(dtype) or 'float' in str(dtype)]
+            # Handle range queries (from X to Y)
+            elif any(pattern in question_lower for pattern in ['from', 'to']) and len(numbers) >= 2:
+                return f"SELECT * FROM {table_name} WHERE {best_col} BETWEEN {numbers[0]} AND {numbers[1]}"
             
-            # Find best matching column by comparing question words with column names
-            question_words = set(question_lower.split())
-            best_col = None
-            max_score = 0
-            
-            for col in numeric_cols:
-                col_words = set(col.lower().replace('_', ' ').split())
-                # Score based on word overlap
-                score = len(question_words.intersection(col_words))
-                if score > max_score:
-                    max_score = score
-                    best_col = col
-            
-            # If no word match, use first numeric column
-            if not best_col and numeric_cols:
-                best_col = numeric_cols[0]
-            
-            if best_col:
+            # Handle single number comparisons
+            elif len(numbers) >= 1:
                 amount = numbers[0]
                 if 'greater' in question_lower or 'more' in question_lower or '>' in question:
                     return f"SELECT * FROM {table_name} WHERE {best_col} > {amount}"
@@ -292,66 +335,30 @@ class DataAnalystAssistant:
                 else:
                     return f"SELECT * FROM {table_name} WHERE {best_col} = {amount}"
         
-        # Strategy 1: Entity extraction for movie/title data
-        entities = self.extract_entities(question)
-        
-        if 'title' in entities:
-            # Find title column
-            title_col = None
-            for col in columns:
-                if 'title' in col.lower() or 'name' in col.lower() or 'movie' in col.lower():
-                    title_col = col
-                    break
-            
-            if title_col:
-                actual_title = self.find_similar_titles(entities['title'], table_name)
-                
-                if any(word in question_lower for word in ['director', 'directed']):
-                    director_col = next((col for col in columns if 'director' in col.lower()), None)
-                    if director_col:
-                        return f"SELECT {director_col} FROM {table_name} WHERE {title_col} LIKE '%{actual_title}%'"
-                elif any(word in question_lower for word in ['cast', 'actor', 'starring']):
-                    cast_col = next((col for col in columns if 'cast' in col.lower() or 'actor' in col.lower()), None)
-                    if cast_col:
-                        return f"SELECT {cast_col} FROM {table_name} WHERE {title_col} LIKE '%{actual_title}%'"
-                else:
-                    return f"SELECT * FROM {table_name} WHERE {title_col} LIKE '%{actual_title}%'"
-        
-        # Always fallback to LLM with better prompt
+        # Always fallback to LLM with enhanced prompt
         schema = self.get_schema_context()
         
-        # Simple, direct prompt
         prompt = f"""Database Schema:
 {schema}
 
 Question: {question}
 
 Write a SQL SELECT query using the exact column names shown above.
+Use BETWEEN for range queries.
+Use AND/OR for multiple conditions.
+Detect all column names mentioned in the question.
 
 SQL:"""
         
-        print(f"Calling LLM with prompt: {prompt[:200]}...")  # Debug
+        print(f"Available columns: {columns}")
+        print(f"Calling LLM with enhanced prompt...")
         llm_response = self.call_llm(prompt, 150)
-        print(f"LLM response: {llm_response}")  # Debug
+        print(f"LLM response: {llm_response}")
         
         if llm_response:
             cleaned = self.clean_sql(llm_response)
-            print(f"Cleaned SQL: {cleaned}")  # Debug
+            print(f"Generated SQL: {cleaned}")
             return cleaned
-        
-        # If LLM fails, try simple pattern matching
-        numbers = re.findall(r'\d+', question)
-        if numbers:
-            # Just use first numeric column and first number
-            for col in columns:
-                try:
-                    cursor = self.db_connection.cursor()
-                    cursor.execute(f"SELECT typeof({col}) FROM {table_name} LIMIT 1")
-                    col_type = cursor.fetchone()[0]
-                    if col_type in ['integer', 'real']:
-                        return f"SELECT * FROM {table_name} WHERE {col} = {numbers[0]}"
-                except:
-                    continue
         
         raise Exception(f"Could not generate SQL. Available columns: {columns}")
     
@@ -373,7 +380,7 @@ SQL:"""
         try:
             return self.smart_search(question)
         except Exception:
-            # Always fallback to LLM - no LIMIT 5
+            # Always fallback to LLM
             schema = self.get_schema_context()
             prompt = f"{schema}\n\nQUESTION: {question}\n\nGenerate SQL query using EXACT column names from schema above. Return ONLY the SQL query.\n\nSQL:"
             
@@ -381,14 +388,16 @@ SQL:"""
             if llm_response:
                 return self.clean_sql(llm_response)
             
-            # If LLM also fails, raise error instead of LIMIT 5
             raise Exception("Could not generate SQL query for your question.")
     
     def execute_query(self, sql_query: str) -> pd.DataFrame:
         try:
-            return pd.read_sql_query(sql_query, self.db_connection)
+            if self.db_type == 'mysql':
+                return pd.read_sql_query(sql_query, self.engine)
+            else:
+                return pd.read_sql_query(sql_query, self.db_connection)
         except Exception as e:
-            if "no such table" in str(e).lower():
+            if "no such table" in str(e).lower() or "doesn't exist" in str(e).lower():
                 available = list(self.tables.keys())
                 raise Exception(f"Table not found. Available: {available}")
             raise Exception(f"Query failed: {str(e)}")

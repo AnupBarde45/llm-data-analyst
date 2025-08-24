@@ -25,14 +25,37 @@ with st.sidebar:
     else:
         api_input = st.text_input("Gemini API Key", type="password")
     
+    # Database selection
+    st.subheader("Database Configuration")
+    db_choice = st.selectbox("Choose Database:", ["SQLite (In-Memory)", "MySQL"])
+    
+    mysql_config = None
+    if db_choice == "MySQL":
+        st.write("MySQL Connection Details:")
+        mysql_host = st.text_input("Host", value="localhost")
+        mysql_port = st.number_input("Port", value=3306)
+        mysql_user = st.text_input("Username")
+        mysql_password = st.text_input("Password", type="password")
+        mysql_database = st.text_input("Database Name")
+        
+        if all([mysql_host, mysql_user, mysql_password, mysql_database]):
+            mysql_config = {
+                'host': mysql_host,
+                'port': int(mysql_port),
+                'user': mysql_user,
+                'password': mysql_password,
+                'database': mysql_database
+            }
+    
     if st.button("Initialize Assistant") and not st.session_state.assistant:
         try:
             if model_choice == "Gemini API":
-                # You'll need to modify DataAnalystAssistant constructor
-                st.session_state.assistant = DataAnalystAssistant(api_input, use_gemini=True)
+                st.session_state.assistant = DataAnalystAssistant(api_input, use_gemini=True, mysql_config=mysql_config)
             else:
-                st.session_state.assistant = DataAnalystAssistant(api_input)
-            st.success(f"Assistant initialized with {model_choice}!")
+                st.session_state.assistant = DataAnalystAssistant(api_input, mysql_config=mysql_config)
+            
+            db_info = "MySQL" if mysql_config else "SQLite"
+            st.success(f"Assistant initialized with {model_choice} and {db_info} database!")
         except Exception as e:
             st.error(f"Failed to initialize: {str(e)}")
     
@@ -109,4 +132,4 @@ if st.session_state.assistant:
                     st.error(result['error'])
 
 else:
-    st.warning("Please initialize the assistant in the sidebar with your preferred LLM.")
+    st.warning("Please initialize the assistant in the sidebar with your preferred LLM and database.")
