@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-from data_analyst import DataAnalystAssistant
+from data_analyst_optimized import DataAnalystAssistant
 import os
 
 st.set_page_config(page_title="Data Analyst Assistant", layout="wide")
